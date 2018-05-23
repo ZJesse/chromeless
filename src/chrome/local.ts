@@ -1,7 +1,9 @@
 import { Chrome, Command, ChromelessOptions, Client } from '../types'
 import * as CDP from 'chrome-remote-interface'
+import { LaunchedChrome, launch } from 'chrome-launcher'
 import LocalRuntime from './local-runtime'
-import { evaluate } from '../util'
+import { evaluate, setViewport } from '../util'
+import { DeviceMetrics } from '../types'
 
 interface RuntimeClient {
   client: Client
@@ -11,6 +13,7 @@ interface RuntimeClient {
 export default class LocalChrome implements Chrome {
   private options: ChromelessOptions
   private runtimeClientPromise: Promise<RuntimeClient>
+  private chromeInstance?: LaunchedChrome
 
   constructor(options: ChromelessOptions = {}) {
     this.options = options
@@ -19,14 +22,63 @@ export default class LocalChrome implements Chrome {
   }
 
   private async initRuntimeClient(): Promise<RuntimeClient> {
-    const target = await CDP.New()
-    const client = await CDP({ target })
+    const client = this.options.launchChrome
+      ? await this.startChrome()
+      : await this.connectToChrome()
 
-    await this.setViewport(client)
+    const { viewport = {} as DeviceMetrics } = this.options
+    await setViewport(client, viewport as DeviceMetrics)
 
     const runtime = new LocalRuntime(client, this.options)
 
     return { client, runtime }
+  }
+
+  private async startChrome(): Promise<Client> {
+    const { port } = this.options.cdp
+    this.chromeInstance = await launch({
+      logLevel: this.options.debug ? 'info' : 'silent',
+      chromeFlags: [
+        // Do not render scroll bars
+        '--hide-scrollbars',
+
+        // The following options copied verbatim from https://github.com/GoogleChrome/chrome-launcher/blob/master/src/flags.ts
+
+        // Disable built-in Google Translate service
+        '--disable-translate',
+        // Disable all chrome extensions entirely
+        '--disable-extensions',
+        // Disable various background network services, including extension updating,
+        //   safe browsing service, upgrade detector, translate, UMA
+        '--disable-background-networking',
+        // Disable fetching safebrowsing lists, likely redundant due to disable-background-networking
+        '--safebrowsing-disable-auto-update',
+        // Disable syncing to a Google account
+        '--disable-sync',
+        // Disable reporting to UMA, but allows for collection
+        '--metrics-recording-only',
+        // Disable installation of default apps on first run
+        '--disable-default-apps',
+        // Mute any audio
+        '--mute-audio',
+        // Skip first run wizards
+        '--no-first-run',
+      ],
+      port,
+    })
+    const target = await CDP.New({
+      port,
+    })
+    return await CDP({ target, port })
+  }
+
+  private async connectToChrome(): Promise<Client> {
+    const { host, port } = this.options.cdp
+    const target = await CDP.New({
+      port,
+      host,
+    })
+    return await CDP({ target, host, port })
   }
 
   private async setViewport(client: Client) {
@@ -39,7 +91,8 @@ export default class LocalChrome implements Chrome {
       fitWindow: false, // as we cannot resize the window, `fitWindow: false` is needed in order for the viewport to be resizable
     }
 
-    const versionResult = await CDP.Version()
+    const { host, port } = this.options.cdp
+    const versionResult = await CDP.Version({ host, port })
     const isHeadless = versionResult['User-Agent'].includes('Headless')
 
     if (viewport.height && viewport.width) {
@@ -52,11 +105,11 @@ export default class LocalChrome implements Chrome {
     } else {
       config.height = await evaluate(
         client,
-        (() => window.innerHeight).toString()
+        (() => window.innerHeight).toString(),
       )
       config.width = await evaluate(
         client,
-        (() => window.innerWidth).toString()
+        (() => window.innerWidth).toString(),
       )
     }
 
@@ -77,7 +130,12 @@ export default class LocalChrome implements Chrome {
     const { client } = await this.runtimeClientPromise
 
     if (this.options.cdp.closeTab) {
-      CDP.Close({ id: client.target.id })
+      const { host, port } = this.options.cdp
+      await CDP.Close({ host, port, id: client.target.id })
+    }
+
+    if (this.chromeInstance) {
+      this.chromeInstance.kill()
     }
 
     await client.close()
